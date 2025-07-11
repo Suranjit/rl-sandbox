@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl-sandbox"
+version = "0.1.0"
+description = "Reinforcement Learning Experimenting Sandbox"
+authors = [
+    { name = "Suranjit Adhikari", email = "suranjit.adhikari@gmail.com" },
+]
+# Requires Python 3.11, as seen in your virtual environment path.
+requires-python = ">=3.11"
+
+
+# --- Core Project Dependencies ---
+dependencies = [
+    "aiohttp-cors==0.8.1",
+    "asitop==0.0.24",
+    "colorful==0.5.7",
+    "dm-tree==0.1.9",
+    "fastapi==0.115.14",
+    "GPUtil==1.4.0",
+    "gymnasium==1.0.0",
+    "httptools==0.6.4",
+    "lz4==4.4.4",
+    "opencensus==0.11.4",
+    "opentelemetry-exporter-prometheus==0.55b1",
+    "opentelemetry-proto==1.34.1",
+    "optuna==4.4.0",
+    "ormsgpack==1.7.0",
+    "pandas==2.3.0",
+    "py-spy==0.4.0",
+    "pyarrow==20.0.0",
+    "pygame==2.6.1",
+    "python-dotenv==1.1.1",
+    "ray==2.47.1",
+    "scipy==1.16.0",
+    "smart_open==7.3.0.post1",
+    "tensorboard==2.19.0",
+    "tensorboardX==2.6.4",
+    "torchaudio==2.7.1",
+    "torchvision==0.22.1",
+    "uvicorn==0.35.0",
+    "uvloop==0.21.0",
+    "watchfiles==1.1.0",
+    "websockets==15.0.1",
+    # Note: The following are development/utility tools.
+    # You might move them to [project.optional-dependencies] in the future.
+    "pipdeptree==2.27.0",
+    "virtualenv==20.31.2",
+]
+
+[project.optional-dependencies]
+  dev = [
+      "pytest",
+      "pytest-cov",
+      "black",
+      "ruff",
+  ]

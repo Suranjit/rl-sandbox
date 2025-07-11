@@ -1,0 +1,25 @@
+# .pre-commit-config.yaml
+# Configuration for pre-commit git hooks.
+# See https://pre-commit.com for more information.
+
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+    -   id: trailing-whitespace
+    -   id: end-of-file-fixer
+    -   id: check-yaml
+    -   id: check-added-large-files
+
+# Ruff is an extremely fast Python linter and code formatter, written in Rust.
+# It can replace Black, Flake8, isort, and many other tools, checking for
+# PEP violations and other common errors.
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    # Ruff version.
+    rev: v0.5.5
+    hooks:
+    # Run the linter and automatically fix issues when possible.
+    -   id: ruff
+        args: [--fix]
+    # Run the formatter.
+    -   id: ruff-format
