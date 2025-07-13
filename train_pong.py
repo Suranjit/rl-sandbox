@@ -1,52 +1,123 @@
-"""CLI tool to tune, train, and evaluate RL agents for Pong.
+"""CLI tool to tune, train, and evaluate RL agents for Pong – **GPU & cluster-aware**
 
-Features
---------
-1. **tune**        – Hyper-parameter search with Optuna.  Saves best config & ckpt under:
-                     models/<strategy>/ppo/<timestamp-hash>/
-2. **train_tuned** – Load the latest tuned checkpoint for <strategy> and continue training
-                     for *N* iterations.
-3. **train**       – Fresh training from scratch (or resume latest) for *N* iterations.
-4. **eval**        – Play the game with the latest best model; optional video recording.
+Major additions
+===============
+1. **Hardware/cluster profiles in JSON** – pass ``--profile <file>.json`` (or one of the
+   built-ins: ``cpu``, ``1gpu``, ``multi_gpu``) to override runner/learner resources.
 
-All modes accept `--strategy` (defaults to "simple").  This selects both the
-Pong *variant* (via env_config["variant"]) and the sub-folder that stores
-checkpoints/configs.
+2. **Generic override mechanism** – any keys inside the JSON are merged into the
+   PPOConfig *after* the base config is built.  This means you can tune *anything*
+   without touching the Python.
+
+3. **Automatic GPU detection** – if no profile is given and CUDA/MPS devices are
+   available we fall back to a single-GPU profile.
+
+Example profiles
+----------------
+```
+{
+  "resources": {
+    "num_gpus": 4,
+    "num_learner_workers": 2,
+    "num_env_runners": 16,
+    "num_envs_per_env_runner": 8
+  },
+  "training": {
+    "train_batch_size": 16384,
+    "minibatch_size": 256,
+    "num_epochs": 20,
+    "lr": 0.0003
+  }
+}
+```
+Save as e.g. ``a100.json`` and run:
+```
+CUDA_VISIBLE_DEVICES=0,1,2,3 python train_pong_gpu_ready.py --mode train \
+    --iters 100 --strategy simple --profile a100.json
+```
+
+---------------------------------- code below ---------------------------------
 """
-
 from __future__ import annotations
 
-import argparse
-import json
-import types
+import argparse, json, types, pathlib, os
 from typing import Any, Dict
 
-import torch
-import ray
+import torch, ray
 from ray import tune, air
 from ray.rllib.algorithms.ppo import PPOConfig
 from ray.rllib.algorithms.algorithm import Algorithm
+from ray.tune import Checkpoint
 from ray.tune.registry import register_env
 from ray.tune.search.optuna import OptunaSearch
 from ray.air.config import CheckpointConfig
-from ray.tune import Checkpoint
 from gymnasium.wrappers import RecordVideo
+
 from pong.paths import (
-    get_best_checkpoint,
-    get_latest_checkpoint,
-    get_strategy_root,
-    get_best_json,
-    build_run_dir,
-    get_video_dir,
+    get_best_checkpoint, get_latest_checkpoint, get_strategy_root,
+    get_best_json, build_run_dir, get_video_dir,
 )
+from pong.env import PongEnv
 from pong.utils.timing import timing
-
-from pong.env import PongEnv  # ← the strategy-aware env we built earlier
+import pprint
 
 # -----------------------------------------------------------------------------
-# 🧹  JSON-serialisation helpers
+# 🔧  Profile helpers
 # -----------------------------------------------------------------------------
 
+BUILT_IN_PROFILES: dict[str, dict[str, Any]] = {
+    "cpu": {
+        "resources": {"num_gpus": 0, "num_env_runners": 4},
+    },
+    "1gpu": {
+        "resources": {"num_gpus": 1, "num_env_runners": 8},
+    },
+    "multi_gpu": {
+        "resources": {"num_gpus": 4, "num_learner_workers": 2, "num_env_runners": 16},
+    },
+}
+
+def make_model_config(pixel: bool, tune_mode: bool):
+    """Return RLlib model_config dict for vector-MLP **or** pixel-CNN."""
+    if pixel:
+        conv_default = [
+            [32, [8, 8], 4],
+            [64, [4, 4], 2],
+            [64, [3, 3], 1],
+        ]
+        if tune_mode:
+            # try a smaller variant as well
+            conv = tune.choice([conv_default,
+                                [[16, [8, 8], 4], [32, [4, 4], 2], [32, [3, 3], 1]]])
+            fc   = tune.choice([[256], [512]])
+        else:
+            conv, fc = conv_default, [512]
+        return {"conv_filters": conv, "fcnet_hiddens": fc}
+
+    # ---------- vector (original) ----------
+    hiddens = tune.choice([[256, 256], [512, 512], [1024, 1024]]) if tune_mode else [512, 512]
+    return {"fcnet_hiddens": hiddens}
+
+
+def load_profile(path_or_key: str | None) -> dict[str, Any]:
+    """Return a profile dict from built-ins or an external JSON file."""
+    if path_or_key is None:
+        # Auto-detect: GPU if available, else CPU
+        return BUILT_IN_PROFILES["1gpu" if torch.cuda.is_available() or torch.backends.mps.is_available() else "cpu"]
+
+    if path_or_key in BUILT_IN_PROFILES:
+        return BUILT_IN_PROFILES[path_or_key]
+
+    # external JSON
+    p = pathlib.Path(path_or_key).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"Profile file not found: {p}")
+    return json.loads(p.read_text())
+
+
+# -----------------------------------------------------------------------------
+# 🧹  JSON serialisation helpers (unchanged)
+# -----------------------------------------------------------------------------
 
 def sanitize_config(config):
     if isinstance(config, dict):
@@ -76,246 +147,257 @@ def create_serializable_dict(data):
 
 
 # -----------------------------------------------------------------------------
-# 🎛️  RLlib configs
+# 🎛️  RLlib config factory
 # -----------------------------------------------------------------------------
 
+def make_base_config(
+    *,
+    strategy: str,
+    profile: dict[str, Any],
+    pixel: bool = False,
+    n_balls: int = 1,
+    frame_stack: int = 4,
+    tune_mode: bool = False,
+) -> PPOConfig:
+    """
+    Build a PPOConfig tailored to *pixel* or *vector* observation pipelines.
 
-def get_base_config(strategy: str, tune_mode: bool = False):
-    model_hiddens = (
-        tune.choice([[256, 256], [512, 512], [1024, 1024]]) if tune_mode else [512, 512]
-    )
+    Parameters
+    ----------
+    strategy     : Pong variant ("simple", "dense", "selfplay", …)
+    profile      : Hardware/cluster profile dict (see load_profile)
+    pixel        : If True use CNN + pixel observations
+    n_balls      : Extra balls (pixel mode only) for robustness
+    frame_stack  : Frames to stack in pixel mode
+    tune_mode    : If True, produce Tune search spaces instead of scalars
+    """
+    # 1️⃣  Model section ----------------------------------------------------
+    model_cfg = make_model_config(pixel, tune_mode)
 
+    # 2️⃣  Training hyper-parameters (pixel vs vector defaults) -------------
+    if pixel:
+        train_batch = tune.choice([4096, 8192, 16384]) if tune_mode else 8192
+        minibatch   = tune.choice([128, 256, 512])     if tune_mode else 256
+        lr_value    = tune.loguniform(1e-5, 1e-3)      if tune_mode else 3e-4
+    else:
+        train_batch = tune.choice([2048, 4096, 8192])  if tune_mode else 4096
+        minibatch   = tune.choice([64, 128, 256])      if tune_mode else 128
+        lr_value    = tune.loguniform(1e-5, 1e-3)      if tune_mode else 5e-5
+
+    # 3️⃣  Core PPOConfig ---------------------------------------------------
     cfg = (
         PPOConfig()
-        .environment(env="PongEnv", env_config={"variant": strategy})
-        .framework("torch")
-        .env_runners(
-            num_env_runners=8, num_envs_per_env_runner=4, rollout_fragment_length="auto"
+
+        # --- Environment ---------------------------------------------------
+        .environment(
+            env="PongEnv",
+            env_config=dict(
+                variant=strategy,
+                pixel_obs=pixel,
+                n_balls=n_balls,
+                frame_stack=frame_stack,
+            ),
         )
-        .resources(num_gpus=1 if torch.backends.mps.is_available() else 0)
+
+        # --- Framework -----------------------------------------------------
+        .framework("torch")
+
+        # --- Runners / Resources ------------------------------------------
+        .env_runners(
+            num_env_runners=profile.get("resources", {}).get("num_env_runners", 4),
+            num_envs_per_env_runner=profile.get("resources", {}).get(
+                "num_envs_per_env_runner", 4
+            ),
+            num_cpus_per_env_runner=1,
+            rollout_fragment_length="auto",
+        )
+        .resources(
+            num_gpus=profile.get("resources", {}).get("num_gpus", 0),
+            num_learner_workers=profile.get("resources", {}).get(
+                "num_learner_workers", 0
+            ),
+        )
+
+        # --- Optimisation --------------------------------------------------
         .training(
-            train_batch_size=tune.choice([2048, 4096, 8192]) if tune_mode else 4096,
-            minibatch_size=tune.choice([64, 128, 256]) if tune_mode else 128,
-            num_epochs=tune.choice([10, 20, 30]) if tune_mode else 30,
-            lr=tune.loguniform(1e-5, 1e-3) if tune_mode else 5e-5,
+            train_batch_size=train_batch,
+            minibatch_size=minibatch,
+            num_epochs=tune.choice([10, 20, 30]) if tune_mode else 20,
+            lr=lr_value,
             gamma=tune.uniform(0.9, 0.999) if tune_mode else 0.99,
             entropy_coeff=tune.uniform(0.001, 0.02) if tune_mode else 0.01,
             lambda_=0.95,
-            clip_param=0.2,
-            vf_clip_param=10.0,
         )
-        .rl_module(model_config={"fcnet_hiddens": model_hiddens})
+
+        # --- Model / RL-Module --------------------------------------------
+        .rl_module(model_config=model_cfg)
     )
+
+    # 4️⃣  Apply arbitrary overrides from the profile ----------------------
+    cfg.update_from_dict({k: v for k, v in profile.items() if k != "resources"})
     return cfg
 
-
-def load_best_config(strategy: str) -> PPOConfig:
-    best_json = get_best_json(strategy)
-    if not best_json.exists():
-        raise FileNotFoundError(f"No best config found for strategy '{strategy}'")
-
-    with best_json.open() as f:
-        data = json.load(f)
-
-    raw_cfg = data.get("best_config", {})
-
-    # Only extract tunable fields you care about — don't include bad serialized types
-    tunable_fields = {
-        "train_batch_size",
-        "minibatch_size",
-        "num_epochs",
-        "lr",
-        "gamma",
-        "entropy_coeff",
-        "lambda_",
-        "model_config",
-    }
-    safe_cfg = {k: v for k, v in raw_cfg.items() if k in tunable_fields}
-
-    base_cfg = get_base_config(strategy, tune_mode=False)
-    base_cfg.update_from_dict(safe_cfg)
-    return base_cfg
-
-
 # -----------------------------------------------------------------------------
-# 🔍  Tune mode
+# 🔍 Tune
 # -----------------------------------------------------------------------------
 
+def tune_mode(strategy: str, 
+              profile: dict[str, Any], 
+              *, 
+              pixel: bool,
+              n_balls: int, 
+              frame_stack: int):
+    print("\n🔍 Starting hyper-parameter tuning…")
 
-def tune_mode(strategy: str):
-    print("\n🔍 Starting hyperparameter tuning…")
-    config = get_base_config(strategy, tune_mode=True)
-
-    run_dir = build_run_dir(strategy, config.to_dict())
+    cfg = make_base_config(
+        strategy=strategy,         # ← add keyword
+        profile=profile,           # ← add keyword
+        pixel=pixel,
+        n_balls=n_balls,
+        frame_stack=frame_stack,
+        tune_mode=True,
+    )
+    
+    run_dir = build_run_dir(strategy, cfg.to_dict())
 
     tuner = tune.Tuner(
         "PPO",
-        param_space=config.to_dict(),
+        param_space=cfg.to_dict(),
         tune_config=tune.TuneConfig(
-            metric="env_runners/episode_return_mean",
-            mode="max",
-            num_samples=10,
+            metric="env_runners/episode_return_mean", mode="max", num_samples=10,
             search_alg=OptunaSearch(),
         ),
         run_config=air.RunConfig(
-            name="tune",
-            storage_path=str(run_dir),
-            stop={"training_iteration": 50},
-            checkpoint_config=CheckpointConfig(
-                checkpoint_at_end=True, checkpoint_frequency=5
-            ),
+            name="tune", storage_path=str(run_dir), stop={"training_iteration": 50},
+            checkpoint_config=CheckpointConfig(checkpoint_at_end=True, checkpoint_frequency=5),
         ),
     )
 
-    result_grid = tuner.fit()
-    best_result = result_grid.get_best_result(
-        metric="env_runners/episode_return_mean", mode="max"
-    )
+    grid = tuner.fit()
+    best = grid.get_best_result("env_runners/episode_return_mean", "max")
 
-    best_run_data = {
-        "best_config": sanitize_config(best_result.config),
-        "best_reward": best_result.metrics["env_runners"]["episode_return_mean"],
-        "best_checkpoint_path": str(best_result.checkpoint.path)
-        if best_result.checkpoint
-        else None,
+    meta = {
+        "best_config": sanitize_config(best.config),
+        "best_reward": best.metrics["env_runners"]["episode_return_mean"],
+        "best_checkpoint_path": str(best.checkpoint.path) if best.checkpoint else None,
     }
-
-    serializable = create_serializable_dict(best_run_data)
-    best_json = get_best_json(strategy)
-    best_json.parent.mkdir(parents=True, exist_ok=True)
-    best_json.write_text(json.dumps(serializable, indent=4))
-
-    print(f"📎 Tuned results saved → {best_json}")
-    print(f"✅ Best reward: {best_run_data['best_reward']:.2f}")
-    print(f"✅ Best checkpoint: {best_run_data['best_checkpoint_path']}")
+    get_best_json(strategy).write_text(json.dumps(create_serializable_dict(meta), indent=2))
+    print(f"✅ Best reward: {meta['best_reward']:.2f}\n✅ Checkpoint: {meta['best_checkpoint_path']}")
 
 
 # -----------------------------------------------------------------------------
-# 🏋️  Train mode
+# 🏋️ Train
 # -----------------------------------------------------------------------------
 
-
-def get_checkpoint_for_eval(strategy: str) -> str | None:
-    ckpt = get_best_checkpoint(strategy)
-    if ckpt:
-        return ckpt
-    return get_latest_checkpoint(strategy)
-
-
-def train_mode(strategy: str, use_tuned: bool, iters: int):
-    print(f"\n🏋️ Starting training for {iters} iterations (strategy = {strategy})…")
-
+def train_mode(strategy: str, 
+               profile: dict[str, Any],
+               *, 
+               pixel: bool, 
+               n_balls: int, 
+               frame_stack: int,
+               use_tuned: bool, 
+               iters: int):
+    
+    print(f"\n🏋️ Training {strategy} for {iters} iters …")
     if use_tuned:
-        ckpt_path = get_best_checkpoint(strategy)
-        if not ckpt_path:
-            print("❌ No tuned checkpoint found. Run --mode tune first.")
-            return
-        print(f"📦 Loading tuned model from {ckpt_path}")
-        algo = Algorithm.from_checkpoint(ckpt_path)
+        ckpt = get_best_checkpoint(strategy)
+        if not ckpt:
+            raise FileNotFoundError("No tuned checkpoint – run tune first.")
+        algo = Algorithm.from_checkpoint(ckpt)
     else:
-        config = get_base_config(strategy, tune_mode=False)
-        algo = config.build()
+        cfg = make_base_config(
+            strategy=strategy,
+            profile=profile,
+            pixel=pixel,
+            n_balls=n_balls,
+            frame_stack=frame_stack,
+            tune_mode=False,
+        )
 
-        if not use_tuned:
-            latest = get_latest_checkpoint(strategy)
-            if latest:
-                try:
-                    print(f"🔄 Attempting to restore from {latest}")
-                    algo.restore(latest)
-                except RuntimeError as e:
-                    print(
-                        f"⚠️ Checkpoint restore failed due to architecture mismatch:\n{e}"
-                    )
-                    print("⏩ Skipping restore and starting fresh.")
+        print("YOooooooooooooooooooooooooooooooooooooooooooooooo\n")
+        pprint.pprint(cfg.to_dict())
+
+        algo = cfg.build()
+        latest = get_latest_checkpoint(strategy)
+        if latest:
+            try:
+                algo.restore(latest)
+                print(f"🔄 Restored from {latest}")
+            except RuntimeError:
+                print("💥 Restore failed – starting fresh.")
+
 
     for i in range(iters):
         with timing(f"Iter {i+1:3d}"):
-            result = algo.train()
-        rew = result["env_runners"]["episode_return_mean"]
-        print(f"Iter {i + 1:3d} | Reward: {rew:.2f}")
+            res = algo.train()
+        print(f"Iter {i+1:3d} | Reward: {res['env_runners']['episode_return_mean']:.2f}")
 
     save_root = get_strategy_root(strategy)
-    saved = algo.save(save_root)
+    result = algo.save(save_root)            # <- may return str / Checkpoint / _TrainingResult
 
-    if isinstance(saved, Checkpoint):
-        ckpt_path = saved.path
-    elif hasattr(saved, "checkpoint"):
-        ckpt_path = saved.checkpoint.path
+    if isinstance(result, Checkpoint):
+        ckpt_path = result.path
+    elif isinstance(result, str):
+        ckpt_path = result                   # sometimes a plain path string
+    elif hasattr(result, "checkpoint") and result.checkpoint is not None:
+        ckpt_path = result.checkpoint.path   # _TrainingResult on new stack
     else:
-        ckpt_path = str(saved)
+        ckpt_path = "<unknown>"
 
-    print(f"✅ Final model saved at: {ckpt_path}")
+    print(f"✅ Model saved at: {ckpt_path}")
     algo.stop()
 
 
 # -----------------------------------------------------------------------------
-# 🎮  Eval mode
+# 🎮 Evaluate
 # -----------------------------------------------------------------------------
 
+def eval_mode(strategy: str, 
+              profile: dict[str, Any], 
+              record: bool,
+              *,  
+              n_balls: int, 
+    ):
+    ckpt = get_best_checkpoint(strategy) or get_latest_checkpoint(strategy)
+    if not ckpt:
+        raise FileNotFoundError("No checkpoint to evaluate.")
+    print(f"🎮 Evaluating {ckpt}")
+    algo = Algorithm.from_checkpoint(ckpt)
 
-def eval_mode(strategy: str, record: bool = False):
-    ckpt_path = get_checkpoint_for_eval(strategy)
-    if not ckpt_path:
-        print("❌ No checkpoint found to evaluate (tuned or regular).")
-        return
-
-    print(f"🎮 Evaluating {ckpt_path}")
-    algo = Algorithm.from_checkpoint(ckpt_path)
-
-    render_mode = "rgb_array" if args.video else "human"
-
-    env_cfg = {
-        "variant":      args.strategy,
-        "render_mode":  render_mode,
-    }
+    env_cfg = {"variant": strategy, "render_mode": "rgb_array" if record else "human"}
     env = PongEnv(env_cfg)
-
     if record:
-        video_dir = get_video_dir(strategy)
-        video_dir.mkdir(parents=True, exist_ok=True)
-        env = RecordVideo(
-            env, 
-            video_folder=str(video_dir), 
-            episode_trigger=lambda x: True,
-            name_prefix=args.strategy,
-        )
-        print(f"📹 Recording gameplay to: {video_dir}")
+        out = get_video_dir(strategy); out.mkdir(parents=True, exist_ok=True)
+        env = RecordVideo(env, video_folder=str(out), episode_trigger=lambda _: True, name_prefix=strategy)
+        print(f"📹 Recording to {out}")
 
-    obs, info = env.reset()
-    done = False
-    module = algo.get_module()
-
-    try:
-        while not done:
-            obs_tensor = torch.from_numpy(obs).unsqueeze(0)
-            logits = module.forward_inference({"obs": obs_tensor})["action_dist_inputs"]
-            action = torch.argmax(logits, dim=1).item()
-            obs, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-    except KeyboardInterrupt:
-        print("\n🛑 Evaluation interrupted.")
-    finally:
-        env.close()
-        ray.shutdown()
+    obs, _ = env.reset(); done = False; module = algo.get_module()
+    while not done:
+        a = torch.argmax(module.forward_inference({"obs": torch.from_numpy(obs).unsqueeze(0)})["action_dist_inputs"], dim=1).item()
+        obs, _, term, trunc, _ = env.step(a); done = term or trunc
+    env.close(); ray.shutdown()
 
 
 # -----------------------------------------------------------------------------
-# 🏑  Entry-point
+# 🏁  Main
 # -----------------------------------------------------------------------------
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--mode", choices=["tune", "train_tuned", "train", "eval"], required=True
-    )
-    parser.add_argument(
-        "--iters", type=int, default=5, help="Training iterations (train modes)"
-    )
-    parser.add_argument(
-        "--strategy", default="simple", help="Pong variant / strategy to use"
-    )
-    parser.add_argument("--video", action="store_true", help="Record video during eval")
-    args = parser.parse_args()
+    argp = argparse.ArgumentParser()
+    argp.add_argument("--mode", choices=["tune", "train_tuned", "train", "eval"], required=True)
+    argp.add_argument("--iters", type=int, default=5)
+    argp.add_argument("--strategy", default="simple")
+    argp.add_argument("--profile", help="Hardware/cluster profile key or JSON file")
+    argp.add_argument("--video", action="store_true", help="Record gameplay during eval")
+    argp.add_argument("--pixel", action="store_true",
+                    help="Use pixel observations + CNN (otherwise vector state)")
+    argp.add_argument("--n-balls", type=int, default=1, dest="n_balls",
+                   help="Spawn extra balls for harder training (pixel mode only)")
+    argp.add_argument("--frame-stack", type=int, default=4, dest="frame_stack",
+                   help="Frames to stack for pixel observations")
+    
+    args = argp.parse_args()
+
+    profile = load_profile(args.profile)
 
     if ray.is_initialized():
         ray.shutdown()
@@ -323,11 +405,14 @@ if __name__ == "__main__":
 
     register_env("PongEnv", lambda cfg: PongEnv(cfg))
 
+    common_kw = dict(pixel=args.pixel, n_balls=args.n_balls,
+                 frame_stack=args.frame_stack)
+
     if args.mode == "tune":
-        tune_mode(args.strategy)
+        tune_mode(args.strategy, profile, **common_kw)
     elif args.mode == "train_tuned":
-        train_mode(args.strategy, use_tuned=True, iters=args.iters)
+        train_mode(args.strategy, profile, use_tuned=True, iters=args.iters, **common_kw)
     elif args.mode == "train":
-        train_mode(args.strategy, use_tuned=False, iters=args.iters)
+        train_mode(args.strategy, profile, use_tuned=False, iters=args.iters, **common_kw)
     elif args.mode == "eval":
-        eval_mode(args.strategy, record=args.video)
+        eval_mode(args.strategy, profile, record=args.video, n_balls=args.n_balls)

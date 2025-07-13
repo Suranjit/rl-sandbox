@@ -8,7 +8,9 @@ from .base import StepStrategy
 _VARIANTS = {
     "simple": "pong.strategy.simple:SimpleStepStrategy",
     "dense": "pong.strategy.dense:DenseRewardStepStrategy",
-    "selfplay": "pong.strategy.selfplay_dense:SelfPlayDenseStepStrategy",
+    "selfplay":      "pong.strategy.selfplay_dense:SelfPlayDenseStepStrategy",
+    "selfplay_dense":"pong.strategy.selfplay_dense:SelfPlayDenseStepStrategy",
+    "pixel":    "pong.strategy.pixel:PixelStepStrategy",
     # add more variants here …
 }
 

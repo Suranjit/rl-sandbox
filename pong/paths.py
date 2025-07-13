@@ -11,6 +11,38 @@ MODELS_DIR = Path(__file__).with_suffix("").parent / "models"  # <repo>/pong/mod
 BASE_MODELS_DIR = (Path(__file__).resolve().parent / "models").expanduser()
 
 
+
+
+# ---------------------------------------------------------------------------
+# internal helpers
+# ---------------------------------------------------------------------------
+
+def _is_checkpoint_dir(p: Path) -> bool:
+    """True iff *p* is an rllib checkpoint folder (contains checkpoint_type)."""
+    return p.is_dir() and (p / "checkpoint_type.json").exists()
+
+
+def _latest_ckpt_under(root: Path) -> str | None:
+    """
+    Return the most-recent rllib checkpoint directory somewhere under *root* –
+    works whether *root* is a run folder or the strategy root.
+    """
+    # ① direct hit (root itself is a checkpoint folder)
+    if _is_checkpoint_dir(root):
+        return str(root)
+
+    # ② search recursively
+    ckpts = sorted(root.glob("**/checkpoint_*"), key=lambda p: p.stat().st_mtime)
+    for p in reversed(ckpts):
+        if _is_checkpoint_dir(p):
+            return str(p)
+
+    # ③ nothing found
+    return None
+
+
+
+
 def _hash_cfg(cfg: dict) -> str:
     """
     Stable 8-char hash.  Any value that isn't JSON-serialisable is
@@ -45,20 +77,20 @@ def get_best_checkpoint(strategy: str) -> str | None:
     if best_json.exists():
         data = json.loads(best_json.read_text())
         ckpt = data.get("best_checkpoint_path")
-        if ckpt and Path(ckpt).exists():
-            return ckpt
+        if ckpt:
+             ckpt_path = _latest_ckpt_under(Path(ckpt))
+             if ckpt_path:
+                return ckpt_path
     return None
-
 
 def get_latest_checkpoint(strategy: str) -> str | None:
     root = get_strategy_root(strategy)
-    paths = glob.glob(str(root / "**/checkpoint_*"), recursive=True)
-    if paths:
-        return max(paths, key=os.path.getmtime)
-    # fallback single-dir checkpoint
-    if (root / "rllib_checkpoint.json").exists():
-        return str(root)
-    return None
+    ckpt = _latest_ckpt_under(root)
+
+    # fallback: old single-dir checkpoints produced by tune() pre-2.5
+    if ckpt is None and (root / "rllib_checkpoint.json").exists():
+        ckpt = str(root)
+    return ckpt
 
 
 def get_strategy_root(strategy: str) -> Path:
