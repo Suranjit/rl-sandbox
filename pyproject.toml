@@ -22,6 +22,7 @@ dependencies = [
     "fastapi==0.115.14",
     "GPUtil==1.4.0",
     "gymnasium==1.0.0",
+    "gymnasium[other]",
     "httptools==0.6.4",
     "lz4==4.4.4",
     "opencensus==0.11.4",
@@ -39,16 +40,13 @@ dependencies = [
     "smart_open==7.3.0.post1",
     "tensorboard==2.19.0",
     "tensorboardX==2.6.4",
+    "torch",
     "torchaudio==2.7.1",
     "torchvision==0.22.1",
     "uvicorn==0.35.0",
     "uvloop==0.21.0",
     "watchfiles==1.1.0",
     "websockets==15.0.1",
-    # Note: The following are development/utility tools.
-    # You might move them to [project.optional-dependencies] in the future.
-    "pipdeptree==2.27.0",
-    "virtualenv==20.31.2",
 ]
 
 [project.optional-dependencies]
@@ -57,4 +55,6 @@ dependencies = [
       "pytest-cov",
       "black",
       "ruff",
+      "pipdeptree==2.27.0",
+      "virtualenv==20.31.2",
   ]

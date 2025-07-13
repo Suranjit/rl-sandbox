@@ -4,19 +4,46 @@ from gymnasium.spaces import Discrete, Box
 import gymnasium as gym
 import pygame
 import os
+import pygame.surfarray
 import numpy as np
+
+# ------------------------------------------------------------------
+# Global helper:  pygame.Surface  ➜  RGB NumPy array
+# ------------------------------------------------------------------
+def _rgb(surface: pygame.Surface) -> np.ndarray:
+    """
+    Convert a Pygame surface to an (H, W, 3) uint8 array in RGB order.
+
+    Gymnasium’s `RecordVideo` wrapper asks `env.render()` for such a frame
+    whenever `render_mode == "rgb_array"`.
+    """
+    arr = pygame.surfarray.array3d(surface)      # (W, H, 3)
+    return np.transpose(arr, (1, 0, 2))          # ➜ (H, W, 3)
+
 
 
 class PongEnv(gym.Env):
     """Core Pong environment – physics, assets, reset, *no* step logic."""
 
-    metadata = {"render_modes": ["human"], "render_fps": 60}
+    metadata = {
+       "render_modes": ["none", "human", "rgb_array"],
+      "render_fps": 60,
+    }
+
+    @staticmethod
+    def _rgb(surface: pygame.Surface) -> np.ndarray:
+        """Return an (H, W, 3) uint8 RGB array for RecordVideo."""
+        return _rgb(surface)      # ← call the global helper directly
+    
 
     def __init__(self, config: dict | None = None):
         super().__init__()
+        pygame.surfarray.use_arraytype("numpy")
         cfg = config or {}
 
         # ------------- Rendering setup -------------
+        self.screen: pygame.Surface | None = None
+        self._screen: pygame.Surface | None = None 
         self.render_mode = cfg.get("render_mode", None)
         self._init_pygame_if_needed()
 
@@ -54,8 +81,9 @@ class PongEnv(gym.Env):
             # Separate fonts for scores and labels
             self.score_font = pygame.font.Font(None, 50)
             self.label_font = pygame.font.Font(None, 24)
+            self._screen = self.screen
         else:
-            self.screen = None
+            self._screen = pygame.Surface((WIDTH, HEIGHT))
             self.clock = None
             self.score_font = None
             self.label_font = None
@@ -112,40 +140,69 @@ class PongEnv(gym.Env):
         """Delegate to the configured StepStrategy."""
         return self.step_strategy.execute(self, action)
 
+
+    # ─────────────────────────────────────────────────────────────
+    # Rendering helpers
+    # ─────────────────────────────────────────────────────────────
+    def _draw(self) -> None:
+        self._screen.fill(BLACK)
+
+        # paddles + (multiple) balls
+        pygame.draw.rect(self._screen, WHITE, self.player_paddle)
+        pygame.draw.rect(self._screen, WHITE, self.opponent_paddle)
+        for b in (self.balls if getattr(self, "pixel_obs", False) else [self.ball]):
+            pygame.draw.ellipse(self._screen, WHITE, b)
+
+        # center net
+        pygame.draw.aaline(
+            self._screen, WHITE, (WIDTH // 2, 0), (WIDTH // 2, HEIGHT)
+        )
+
+        # UI overlays only when actually viewing
+        if self.render_mode == "human":
+            # scores
+            ptxt = self.score_font.render(str(self.player_score), True, WHITE)
+            otxt = self.score_font.render(str(self.opponent_score), True, WHITE)
+            self._screen.blit(ptxt, (WIDTH * 3 / 4, 35))
+            self._screen.blit(otxt, (WIDTH * 1 / 4, 35))
+
+            # labels
+            if getattr(self, "show_labels", True):
+                pad = 5
+                rl = self.label_font.render("RL Agent", True, WHITE)
+                ai = self.label_font.render("Opponent", True, WHITE)
+                self._screen.blit(rl, (WIDTH - rl.get_width() - pad, pad))
+                self._screen.blit(ai, (pad, pad))
+
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
     def render(self):
-        if self.screen is None:
-            return
+        """
+        • human      → blit/flip to on-screen window (real-time play/debug)
+        • rgb_array  → return np.uint8 frame for wrappers (RecordVideo, etc.)
+        • none       → fastest; no rendering
+        """
+        # draw current state to hidden surface
+        self._draw()
 
-        # 1️⃣ Draw game objects
-        self.screen.fill(BLACK)
-        pygame.draw.rect(self.screen, WHITE, self.player_paddle)
-        pygame.draw.rect(self.screen, WHITE, self.opponent_paddle)
-        pygame.draw.ellipse(self.screen, WHITE, self.ball)
-        pygame.draw.aaline(self.screen, WHITE, (WIDTH // 2, 0), (WIDTH // 2, HEIGHT))
+        if self.render_mode == "human":
+            # if _screen **is not** the display surface, blit it first
+            if self._screen is not pygame.display.get_surface():
+                pygame.display.get_surface().blit(self._screen, (0, 0))
+            pygame.display.flip()
+            self.clock.tick(self.metadata["render_fps"])
+            return None
 
-        # 2️⃣ Scores
-        player_text = self.score_font.render(f"{self.player_score}", True, WHITE)
-        self.screen.blit(
-            player_text, (WIDTH * 3 / 4, 35)
-        )  # slightly lower to avoid overlapping label
-        opponent_text = self.score_font.render(f"{self.opponent_score}", True, WHITE)
-        self.screen.blit(opponent_text, (WIDTH * 1 / 4, 35))
+        elif self.render_mode == "rgb_array":
+            # copy() so caller cannot mutate internal surface
+            return self._rgb(self._screen).copy()
 
-        # 3️⃣ Labels – clearly mark agent vs opponent
-        padding = 5
-        rl_label = self.label_font.render("RL Agent", True, WHITE)
-        ai_label = self.label_font.render("Opponent", True, WHITE)
-        # top‑right & top‑left
-        self.screen.blit(rl_label, (WIDTH - rl_label.get_width() - padding, padding))
-        self.screen.blit(ai_label, (padding, padding))
-
-        # 4️⃣ Flip – limit FPS
-        pygame.display.flip()
-        self.clock.tick(self.metadata["render_fps"])
+        # render_mode == "none"
+        return None
 
     def close(self):
+        # Only quit pygame if we were in interactive ("human") mode
         if self.screen is not None:
+            pygame.display.quit()
             pygame.quit()

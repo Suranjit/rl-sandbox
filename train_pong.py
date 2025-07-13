@@ -30,6 +30,7 @@ from ray.tune.registry import register_env
 from ray.tune.search.optuna import OptunaSearch
 from ray.air.config import CheckpointConfig
 from ray.tune import Checkpoint
+from gymnasium.wrappers import RecordVideo
 from pong.paths import (
     get_best_checkpoint,
     get_latest_checkpoint,
@@ -38,6 +39,7 @@ from pong.paths import (
     build_run_dir,
     get_video_dir,
 )
+from pong.utils.timing import timing
 
 from pong.env import PongEnv  # ← the strategy-aware env we built earlier
 
@@ -88,7 +90,7 @@ def get_base_config(strategy: str, tune_mode: bool = False):
         .environment(env="PongEnv", env_config={"variant": strategy})
         .framework("torch")
         .env_runners(
-            num_env_runners=4, num_envs_per_env_runner=8, rollout_fragment_length="auto"
+            num_env_runners=8, num_envs_per_env_runner=4, rollout_fragment_length="auto"
         )
         .resources(num_gpus=1 if torch.backends.mps.is_available() else 0)
         .training(
@@ -227,7 +229,8 @@ def train_mode(strategy: str, use_tuned: bool, iters: int):
                     print("⏩ Skipping restore and starting fresh.")
 
     for i in range(iters):
-        result = algo.train()
+        with timing(f"Iter {i+1:3d}"):
+            result = algo.train()
         rew = result["env_runners"]["episode_return_mean"]
         print(f"Iter {i + 1:3d} | Reward: {rew:.2f}")
 
@@ -258,16 +261,23 @@ def eval_mode(strategy: str, record: bool = False):
 
     print(f"🎮 Evaluating {ckpt_path}")
     algo = Algorithm.from_checkpoint(ckpt_path)
-    from gymnasium.wrappers import RecordVideo
 
-    env_cfg: Dict[str, Any] = {"variant": strategy, "render_mode": "human"}
+    render_mode = "rgb_array" if args.video else "human"
+
+    env_cfg = {
+        "variant":      args.strategy,
+        "render_mode":  render_mode,
+    }
     env = PongEnv(env_cfg)
 
     if record:
         video_dir = get_video_dir(strategy)
         video_dir.mkdir(parents=True, exist_ok=True)
         env = RecordVideo(
-            env, video_folder=str(video_dir), episode_trigger=lambda x: True
+            env, 
+            video_folder=str(video_dir), 
+            episode_trigger=lambda x: True,
+            name_prefix=args.strategy,
         )
         print(f"📹 Recording gameplay to: {video_dir}")
 
