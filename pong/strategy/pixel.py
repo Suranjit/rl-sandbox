@@ -2,10 +2,10 @@ import numpy as np
 import cv2
 from collections import deque
 from pong.constants import *
-from .dense import DenseRewardStepStrategy
+from .multiball import MultiBallStepStrategy
 
 
-class PixelStepStrategy(DenseRewardStepStrategy):
+class PixelStepStrategy(MultiBallStepStrategy):
     """
     • 4-frame stack of 84×84 grayscale images ∈ [0, 1] float32
     • Action-repeat (frame-skip) = 4
@@ -23,7 +23,6 @@ class PixelStepStrategy(DenseRewardStepStrategy):
 
     # ───────────────────────── helpers ──────────────────────────
     def _preprocess(self, rgb: np.ndarray) -> np.ndarray:
-        """RGB → grayscale (84×84) → float32 in [0, 1]."""
         gray     = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         resized  = cv2.resize(gray, self.obs_shape, interpolation=cv2.INTER_AREA)
         return (resized.astype(np.float32) / 255.0)          # (H,W) float32

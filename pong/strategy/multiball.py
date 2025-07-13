@@ -24,63 +24,74 @@ class MultiBallStepStrategy(DenseRewardStepStrategy):
     # ------------------------------------------------------------------ main
     def execute(self, env, action):
     # ─────────────────── agent paddle ────────────────────
-    if action == 1:
-        env.player_paddle.y -= PADDLE_SPEED
-    elif action == 2:
-        env.player_paddle.y += PADDLE_SPEED
-    env.player_paddle.y = np.clip(env.player_paddle.y, 0, HEIGHT - PADDLE_HEIGHT)
+        if action == 1:
+            env.player_paddle.y -= PADDLE_SPEED
+        elif action == 2:
+            env.player_paddle.y += PADDLE_SPEED
+        env.player_paddle.y = np.clip(env.player_paddle.y, 0, HEIGHT - PADDLE_HEIGHT)
 
-    # ────────────────── opponent heuristic ───────────────
-    closest = min(env.balls,
-                  key=lambda b: abs(b.centery - env.opponent_paddle.centery))
-    if env.opponent_paddle.centery < closest.centery:
-        env.opponent_paddle.y += PADDLE_SPEED * 0.7
-    else:
-        env.opponent_paddle.y -= PADDLE_SPEED * 0.7
-    env.opponent_paddle.y = np.clip(env.opponent_paddle.y, 0, HEIGHT - PADDLE_HEIGHT)
+        # ────────────────── opponent heuristic ───────────────
+        # Find all balls moving towards the opponent (left)
+        threatening_balls = [
+            b for b, vel in zip(env.balls, env.ball_velocities) if vel[0] < 0
+        ]
 
-    # ───────────────── physics / rewards ─────────────────
-    total_reward, terminated, truncated = 0.0, False, False
+        target_y = HEIGHT // 2  # Default: center the paddle if no threats
 
-    for ball, vel in zip(env.balls, env.ball_velocities):
-        # move
-        ball.x += vel[0]; ball.y += vel[1]
+        if threatening_balls:
+            # Of the threatening balls, find the one that is closest to the paddle
+            # This is the one that will arrive first.
+            target_ball = min(threatening_balls, key=lambda b: b.x)
+            target_y = target_ball.centery
 
-        # wall bounce
-        if ball.top <= 0 or ball.bottom >= HEIGHT:
-            vel[1] *= -1
+        if env.opponent_paddle.centery < target_y:
+            env.opponent_paddle.y += PADDLE_SPEED * 0.7
+        else:
+            env.opponent_paddle.y -= PADDLE_SPEED * 0.7
+        env.opponent_paddle.y = np.clip(env.opponent_paddle.y, 0, HEIGHT - PADDLE_HEIGHT)
 
-        # paddle bounce
-        if ball.colliderect(env.player_paddle):
-            vel[0] *= -1.05; vel[1] *= 1.05
-            ball.x = env.player_paddle.left - ball.width
-            total_reward += 1.0
-            env.steps_since_last_hit = 0
-        elif ball.colliderect(env.opponent_paddle):
-            vel[0] *= -1
-            ball.x = env.opponent_paddle.right
+        # ───────────────── physics / rewards ─────────────────
+        total_reward, terminated, truncated = 0.0, False, False
 
-        # scoring / miss
-        if ball.right >= WIDTH:              # agent missed
-            total_reward -= 1.0
-            env.opponent_score += 1
-            terminated = True
-        elif ball.left <= 0:                 # agent scores
-            total_reward += 1.0
-            env.player_score += 1
-            terminated = True
+        for ball, vel in zip(env.balls, env.ball_velocities):
+            # move
+            ball.x += vel[0]; ball.y += vel[1]
 
-        # dense alignment shaping
-        align = 1 - abs(env.player_paddle.centery - ball.centery) / HEIGHT
-        total_reward += 0.01 * align         # 0.01 is arbitrary
+            # wall bounce
+            if ball.top <= 0 or ball.bottom >= HEIGHT:
+                vel[1] *= -1
 
-        if terminated:
-            break
+            # paddle bounce
+            if ball.colliderect(env.player_paddle):
+                vel[0] *= -1.05; vel[1] *= 1.05
+                ball.x = env.player_paddle.left - ball.width
+                total_reward += 1.0
+                env.steps_since_last_hit = 0
+            elif ball.colliderect(env.opponent_paddle):
+                vel[0] *= -1
+                ball.x = env.opponent_paddle.right
 
-    # time-limit truncation
-    truncated = env.steps_since_last_hit > 600
+            # scoring / miss
+            if ball.right >= WIDTH:              # agent missed
+                total_reward -= 1.0
+                env.opponent_score += 1
+                terminated = True
+            elif ball.left <= 0:                 # agent scores
+                total_reward += 2.0
+                env.player_score += 1
+                terminated = True
 
-    if env.render_mode == "human":
-        env.render()
+            # dense alignment shaping
+            align = 1 - abs(env.player_paddle.centery - ball.centery) / HEIGHT
+            total_reward += 0.01 * align         # 0.01 is arbitrary
 
-    return env._get_obs(), total_reward, terminated, truncated, env._get_info()
+            if terminated:
+                break
+
+        # time-limit truncation
+        truncated = env.steps_since_last_hit > 600
+
+        if env.render_mode == "human":
+            env.render()
+
+        return env._get_obs(), total_reward, terminated, truncated, env._get_info()
