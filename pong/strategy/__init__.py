@@ -10,7 +10,8 @@ _VARIANTS = {
     "dense": "pong.strategy.dense:DenseRewardStepStrategy",
     "selfplay":      "pong.strategy.selfplay_dense:SelfPlayDenseStepStrategy",
     "selfplay_dense":"pong.strategy.selfplay_dense:SelfPlayDenseStepStrategy",
-    "pixel":    "pong.strategy.pixel:PixelStepStrategy",
+    "multiball": "pong.strategy.multiball:MultiBallStepStrategy", 
+    "pixel": "pong.strategy.pixel:PixelStepStrategy", 
     # add more variants here …
 }
 

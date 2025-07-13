@@ -14,3 +14,6 @@ class StepStrategy(ABC):
     @abstractmethod
     def execute(self, env: "PongEnv", action: int):
         """Run one timestep and return (obs, reward, terminated, truncated, info)."""
+
+    def reset(self, env):
+         return None

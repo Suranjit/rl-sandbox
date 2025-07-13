@@ -206,7 +206,7 @@ def make_base_config(
         .env_runners(
             num_env_runners=profile.get("resources", {}).get("num_env_runners", 4),
             num_envs_per_env_runner=profile.get("resources", {}).get(
-                "num_envs_per_env_runner", 4
+                "num_envs_per_env_runner", 8
             ),
             num_cpus_per_env_runner=1,
             rollout_fragment_length="auto",

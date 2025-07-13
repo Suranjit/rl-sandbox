@@ -130,31 +130,34 @@ class PongEnv(gym.Env):
     # ----------------------------------------------------------------------
     # reset
     # ----------------------------------------------------------------------
+
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
 
-        # paddles
+        # ───────────────────────── game objects ──────────────────────────
         self.player_paddle = pygame.Rect(
-            WIDTH - PADDLE_WIDTH - 20, HEIGHT//2 - PADDLE_HEIGHT//2,
-            PADDLE_WIDTH, PADDLE_HEIGHT)
+            WIDTH - PADDLE_WIDTH - 20, HEIGHT // 2 - PADDLE_HEIGHT // 2,
+            PADDLE_WIDTH, PADDLE_HEIGHT,
+        )
         self.opponent_paddle = pygame.Rect(
-            20, HEIGHT//2 - PADDLE_HEIGHT//2,
-            PADDLE_WIDTH, PADDLE_HEIGHT)
+            20, HEIGHT // 2 - PADDLE_HEIGHT // 2,
+            PADDLE_WIDTH, PADDLE_HEIGHT,
+        )
 
-        # primary ball
         self.ball = pygame.Rect(
-            WIDTH//2 - BALL_RADIUS, HEIGHT//2 - BALL_RADIUS,
-            BALL_RADIUS*2, BALL_RADIUS*2)
+            WIDTH // 2 - BALL_RADIUS, HEIGHT // 2 - BALL_RADIUS,
+            BALL_RADIUS * 2, BALL_RADIUS * 2,
+        )
         self.ball_velocity = [
             BALL_SPEED_X_INITIAL * random.choice([1, -1]),
             BALL_SPEED_Y_INITIAL * random.choice([1, -1]),
         ]
 
-        # scores & timers
+        # scores / timers
         self.player_score = self.opponent_score = 0
         self.steps_since_last_hit = 0
 
-        # --------- multi-ball state ----------
+        # ─────────────── multiball bookkeeping (balls[0] is primary) ─────
         self.balls           = [self.ball]
         self.ball_velocities = [np.array(self.ball_velocity, np.float32)]
 
@@ -162,14 +165,29 @@ class PongEnv(gym.Env):
             for _ in range(self.n_balls - 1):
                 self._add_ball()
 
-        # --------- frame-stack init ----------
-        if self.pixel_obs:
-            self._frame_buffer = []
-            frame = self._capture_frame()
-            self._frame_buffer = [frame] * self.frame_stack
-            obs = np.stack(self._frame_buffer, axis=0)
+        # ───────────────────── observation delegation ────────────────────
+        # If the chosen StepStrategy implements its own `reset(env)` we call
+        # it and *trust* it to return an observation that matches whatever
+        # `observation_space` was set to in __init__.
+        if hasattr(self.step_strategy, "reset"):
+            obs = self.step_strategy.reset(self)
+            if obs is None:                        # legacy strategies
+                if self.pixel_obs:
+                    self._frame_buffer = []
+                    frame = self._capture_frame()
+                    self._frame_buffer = [frame] * self.frame_stack
+                    obs = np.stack(self._frame_buffer, axis=0).astype(np.float32)
+                else:
+                    obs = self._get_obs()
+            return obs, self._get_info()
         else:
-            obs = self._get_obs()
+            # Fallback to the environment’s built-in observation logic
+            if self.pixel_obs:
+                frame = self._capture_frame()
+                self._frame_buffer = [frame] * self.frame_stack
+                obs = np.stack(self._frame_buffer, axis=0)
+            else:
+                obs = self._get_obs()
 
         return obs, self._get_info()
 
@@ -182,7 +200,7 @@ class PongEnv(gym.Env):
         if len(self.balls) > 1:
             self._update_extra_balls()
 
-        if self.pixel_obs:
+        if self.pixel_obs and not getattr(self.step_strategy, "handles_pixels", False) :
             frame = self._capture_frame()
             self._frame_buffer.append(frame)
             self._frame_buffer = self._frame_buffer[-self.frame_stack:]
