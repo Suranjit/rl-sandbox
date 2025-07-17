@@ -176,6 +176,7 @@ def make_base_cfg(
         .resources(
             num_gpus            = res.get("num_gpus", 0),
             num_learner_workers = res.get("num_learner_workers", 0),
+            num_gpus_per_learner_worker = res.get("num_gpus_per_learner", 0)
         )
 
         # --- Optimisation -----------------------------------------------
@@ -190,14 +191,20 @@ def make_base_cfg(
             gamma            = 0.99,
             entropy_coeff    = 0.01,
             lambda_          = 0.95,
+            optimizer        = {"foreach": False},
         )
 
         # --- Model / RL-Module ------------------------------------------
         .rl_module(model_config=mdl)
     )
 
-    # ── “Anything-override” (lets JSON tweak *any* PPOConfig field) ──────
-    cfg.update_from_dict({k: v for k, v in profile.items() if k != "resources"})
+    training_overrides = profile.pop("training", {})
+    # Update the existing training config instead of replacing it.
+    if training_overrides:
+        cfg.training(**training_overrides)
+
+    # Now apply the rest of the overrides from the profile.
+    cfg.update_from_dict({k: v for k, v in profile.items() if k not in ["resources", "training"]})
 
     return cfg
 
@@ -334,28 +341,79 @@ def train_mode(strategy, profile, *, pixel, n_balls, frame_stack, use_tuned, ite
     print(f"✅ Saved checkpoint at {ckpt}")
     algo.stop()
 
-def eval_mode(strategy, profile, *, record, n_balls):
+def eval_mode(strategy, profile, *, pixel, frame_stack, record, n_balls):
+    import torch
+    from ray.rllib.algorithms.algorithm import Algorithm
+
+    # 1) pick up the best or latest GPU-trained checkpoint
     ckpt = get_best_checkpoint(strategy) or get_latest_checkpoint(strategy)
     if not ckpt:
-        raise FileNotFoundError("No checkpoint found.")
-    algo = Algorithm.from_checkpoint(ckpt)
-    env_cfg = {"variant": strategy,
-               "render_mode": "rgb_array" if record else "human"}
+        raise FileNotFoundError(
+            "No checkpoint found – did you run `--mode tune` or `train_tuned`?"
+        )
+
+    # 2) build a CPU-only config matching your original run settings
+    cpu_profile = load_profile("cpu")
+    cfg = make_base_cfg(
+        strategy=strategy,
+        profile=cpu_profile,
+        pixel=pixel,
+        n_balls=n_balls,
+        frame_stack=frame_stack,
+        tune_mode=False,
+    )
+    algo = cfg.build()
+
+    # 3) patch torch.load so that all checkpoint tensors map to CPU
+    _orig_torch_load = torch.load
+    torch.load = lambda f, **kwargs: _orig_torch_load(
+        f, map_location=torch.device("cpu"),
+        **{k: v for k, v in kwargs.items() if k != "map_location"}
+    )
+    try:
+        algo.restore(ckpt)
+    finally:
+        torch.load = _orig_torch_load  # restore original
+
+    # 4) spin up your env with the same pixel/frame_stack settings
+    env_cfg = {
+        "variant": strategy,
+        "pixel_obs": pixel,
+        "frame_stack": frame_stack,
+        "n_balls": n_balls,
+        "render_mode": "rgb_array" if record else "human",
+    }
     env = PongEnv(env_cfg)
     if record:
         out = get_video_dir(strategy); out.mkdir(parents=True, exist_ok=True)
-        env = RecordVideo(env, video_folder=str(out),
-                          episode_trigger=lambda _: True, name_prefix=strategy)
+        env = RecordVideo(
+            env,
+            video_folder=str(out),
+            episode_trigger=lambda _: True,
+            name_prefix=strategy,
+        )
         print(f"📹 Recording → {out}")
 
-    obs, _ = env.reset(); done = False
-    mod = algo.get_module()
+    # 5) grab the RLModule for inference
+    module = algo.get_module()
+
+    # 6) run one episode with forward_inference
+    obs, _ = env.reset()
+    done = False
     while not done:
-        act = torch.argmax(mod.forward_inference(
-            {"obs": torch.from_numpy(obs).unsqueeze(0)} )["action_dist_inputs"], 1).item()
-        obs, _, term, trunc, _ = env.step(act)
+        # build a batch of size 1
+        obs_tensor = torch.from_numpy(obs).unsqueeze(0)
+        out = module.forward_inference({"obs": obs_tensor})
+        # logits under key "action_dist_inputs"
+        logits = out["action_dist_inputs"]
+        # pick the highest-prob action
+        action = int(logits.argmax(dim=1)[0].item())
+
+        obs, _, term, trunc, _ = env.step(action)
         done = term or trunc
-    env.close(); ray.shutdown()
+
+    env.close()
+    ray.shutdown()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 🏁  CLI
@@ -387,7 +445,7 @@ if __name__ == "__main__":
 
     ray.init(
          address=args.ray_address,
-         logging_level="ERROR"
+         logging_level="INFO"
     )
 
     register_env("PongEnv", lambda cfg: PongEnv(cfg))
@@ -402,5 +460,11 @@ if __name__ == "__main__":
         train_mode(args.strategy, profile, use_tuned=True,
                    iters=args.iters, **kw)
     elif args.mode == "eval":
-        eval_mode(args.strategy, profile, record=args.video,
-                  n_balls=args.n_balls)
+        eval_mode(
+        args.strategy,
+        profile,
+        pixel=args.pixel,
+        frame_stack=args.frame_stack,
+        record=args.video,
+        n_balls=args.n_balls,
+    )

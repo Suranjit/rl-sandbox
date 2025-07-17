@@ -10,17 +10,21 @@ import time
 MODELS_DIR = Path(__file__).with_suffix("").parent / "models"  # <repo>/pong/models
 BASE_MODELS_DIR = (Path(__file__).resolve().parent / "models").expanduser()
 
-
-
-
 # ---------------------------------------------------------------------------
 # internal helpers
 # ---------------------------------------------------------------------------
 
 def _is_checkpoint_dir(p: Path) -> bool:
-    """True iff *p* is an rllib checkpoint folder (contains checkpoint_type)."""
-    return p.is_dir() and (p / "checkpoint_type.json").exists()
-
+    """
+    True iff *p* is an RLlib checkpoint folder:
+      - its name starts with "checkpoint_"
+      - it contains one of the RLlib metadata files.
+    """
+    return (
+        p.is_dir()
+        and p.name.startswith("checkpoint_")
+        and (p / "rllib_checkpoint.json").exists()
+    )
 
 def _latest_ckpt_under(root: Path) -> str | None:
     """
@@ -104,3 +108,7 @@ def get_best_json(strategy: str) -> Path:
 
 def get_video_dir(strategy: str) -> Path:
     return get_strategy_root(strategy) / "videos"
+
+
+print("BASE_MODELS_DIR:", BASE_MODELS_DIR)
+print("Dense strategy root:", get_strategy_root("dense"))
