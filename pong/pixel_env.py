@@ -227,7 +227,7 @@ class PixelPongEnv(gym.Env):
     def _draw(self, show_overlays: bool = True):
         self._screen.fill(BLACK)
         pygame.draw.rect(self._screen, WHITE, self.player_paddle)
-        pygame.draw.rect(self.screen, WHITE, self.opponent_paddle)
+        pygame.draw.rect(self._screen, WHITE, self.opponent_paddle)
         for b in self.balls:
             pygame.draw.ellipse(self._screen, WHITE, b)
         pygame.draw.aaline(self._screen, WHITE, (WIDTH//2,0), (WIDTH//2,HEIGHT))
