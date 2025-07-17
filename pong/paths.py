@@ -1,11 +1,13 @@
 # pong/paths.py  (no other project code should import ray here)
 from __future__ import annotations
+
 from pathlib import Path
 import glob
 import hashlib
 import json
 import os
 import time
+from typing import Dict, Any
 
 MODELS_DIR = Path(__file__).with_suffix("").parent / "models"  # <repo>/pong/models
 BASE_MODELS_DIR = (Path(__file__).resolve().parent / "models").expanduser()
@@ -108,7 +110,3 @@ def get_best_json(strategy: str) -> Path:
 
 def get_video_dir(strategy: str) -> Path:
     return get_strategy_root(strategy) / "videos"
-
-
-print("BASE_MODELS_DIR:", BASE_MODELS_DIR)
-print("Dense strategy root:", get_strategy_root("dense"))
